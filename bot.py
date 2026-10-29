@@ -396,54 +396,76 @@ def start_checkout(chat, msg, cart):
     show(chat, msg, cart_text(cart) + "\n\n<b>Как получите заказ?</b>", ik(rows))
 
 
-def prompt_address(chat, st):
-    st["s"] = "address"
-    send_message(chat, "<b>Куда привезти?</b>\nОтветьте на это сообщение адресом: улица, дом, подъезд, этаж.\n"
-                       "Отменить: /cancel" + hidden(st),
-                 {**FORCE, "input_field_placeholder": "Улица, дом, подъезд, этаж"})
+STEP_TITLE = {"address": "Адрес", "phone": "Телефон", "pay": "Оплата", "comment": "Комментарий"}
+PROMPT = {
+    "address": ("📍 <b>Куда привезти?</b>\nУлица, дом, подъезд, этаж.", "Улица, дом, подъезд, этаж"),
+    "phone": ("📞 <b>Номер для связи</b>\nНапример, +995 555 12 34 56.", "+995 ..."),
+    "comment": ("💬 <b>Комментарий к заказу</b>\nНапример, «без лука» или «позвоните у двери».", "Ваш комментарий"),
+}
 
 
-def prompt_phone(chat, st):
-    st["s"] = "phone"
-    send_message(chat, "<b>Номер для связи</b>\nОтветьте на это сообщение номером телефона, например "
-                       "+995 555 12 34 56. Отменить: /cancel" + hidden(st),
-                 {**FORCE, "input_field_placeholder": "+995 ..."})
+def steps_for(st):
+    return ["address", "phone", "pay", "comment"] if st["t"] == "delivery" else ["phone", "pay", "comment"]
 
 
-def ask_payment(chat, st):
-    st["s"] = "pay"
-    rows = [[btn(p, f"pay:{n}") for n, p in enumerate(PAYMENTS)]]
-    send_message(chat, "<b>Как будете платить при получении?</b>" + hidden(st), ik(rows))
-
-
-def prompt_comment(chat, st):
-    st["s"] = "comment"
-    send_message(chat, "<b>Комментарий к заказу</b>\nОтветьте на это сообщение, например «без лука» или "
-                       "«позвоните у двери». Если не нужен, отправьте «-». Отменить: /cancel" + hidden(st),
-                 {**FORCE, "input_field_placeholder": "Комментарий или «-»"})
-
-
-def draft_text(st):
+def card_text(st):
+    """Карточка оформления: одно сообщение, которое обновляется на каждом шаге."""
+    steps = steps_for(st)
     cart = cart_decode(st["c"])
-    out = ["<b>Проверьте заказ</b>", ""]
+    s = st["s"]
+    out = ["<b>Оформление заказа</b>"]
+    out.append(f"Шаг {steps.index(s) + 1} из {len(steps)} · {STEP_TITLE[s]}" if s in steps
+               else "Остался один клик · проверьте заказ")
+    out.append("")
     for it, q in cart_lines(cart):
-        out.append(f"• {esc(it['name'])} × {q} = {money(it['price'] * q)}")
-    out += ["", f"Итого: <b>{money(cart_total(cart))}</b> (без доставки)", ""]
-    if st["t"] == "delivery":
-        out += ["🛵 Доставка", f"Адрес: {esc(st['a'])}"]
-    else:
-        out.append(f"🏃 Самовывоз: {esc(ADDRESS)}")
-    out.append(f"Телефон: {esc(st['p'])}")
-    out.append(f"Оплата: {esc(st['y'])}")
+        out.append(f"• {esc(it['name'])} × {q}")
+    out += ["", f"Итого: <b>{money(cart_total(cart))}</b> <i>(без доставки)</i>", ""]
+    out.append("🛵 Доставка" if st["t"] == "delivery" else f"🏃 Самовывоз · {esc(ADDRESS)}")
+    if st.get("a"):
+        out.append(f"📍 {esc(st['a'])}")
+    if st.get("p"):
+        out.append(f"📞 {esc(st['p'])}")
+    if st.get("y"):
+        out.append(f"💳 {esc(st['y'])}")
     if st.get("m"):
-        out.append(f"Комментарий: {esc(st['m'])}")
+        out.append(f"💬 {esc(st['m'])}")
+    if s == "pay":
+        out += ["", "<b>Как будете платить при получении?</b>"]
+    elif s in PROMPT:
+        out += ["", "<i>Ответьте на сообщение ниже ⬇️</i>"]
     return "\n".join(out)
 
 
-def ask_confirm(chat, st):
-    st["s"] = "confirm"
-    send_message(chat, draft_text(st) + hidden(st),
-                 ik([[btn("✅ Отправить заказ", "ok")], [btn("✖️ Отмена", "no")]]))
+def card_kb(st):
+    cancel = [btn("✖️ Отменить оформление", "x")]
+    s = st["s"]
+    if s == "pay":
+        return ik([[btn(p, f"pay:{n}") for n, p in enumerate(PAYMENTS)], cancel])
+    if s == "comment":
+        return ik([[btn("Без комментария", "nc")], cancel])
+    if s == "confirm":
+        return ik([[btn("✅ Отправить заказ", "ok")], cancel])
+    return ik([cancel])
+
+
+def goto(chat, st, step, note=None):
+    """Перейти на шаг: убрать прежний вопрос, задать новый и обновить карточку."""
+    st["s"] = step
+    old = st.pop("k", None)
+    if old:
+        delete_message(chat, old)
+    if step in PROMPT:
+        text, hint = PROMPT[step]
+        if note:
+            text = f"⚠️ {note}\n\n{text}"
+        m = send_message(chat, text + hidden(st), {**FORCE, "input_field_placeholder": hint})
+        st["k"] = m["message_id"]
+    try:
+        edit_text(chat, st["w"], card_text(st) + hidden(st), card_kb(st))
+    except TgError as e:
+        if "not modified" not in e.desc:
+            raise
+
 
 
 def set_orders_chat(chat):
@@ -467,21 +489,24 @@ def handle_reply(msg, st):
     chat = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
     step = st.get("s")
+    st["k"] = msg["reply_to_message"]["message_id"]      # вопрос, на который ответили
+    delete_message(chat, msg["message_id"])               # ответ клиента убираем, чтобы чат был чистым
     if not text:
-        return send_message(chat, "Нужен текст. Ответьте на сообщение выше обычным сообщением.")
+        return goto(chat, st, step, "Нужен текст, а не файл.")
     if step == "address":
         if len(text) < 5:
-            return send_message(chat, "Напишите адрес подробнее: улица, дом, подъезд.")
+            return goto(chat, st, step, "Напишите адрес подробнее.")
         st["a"] = text[:300]
-        return prompt_phone(chat, st)
+        return goto(chat, st, "phone")
     if step == "phone":
         if not 9 <= len(re.sub(r"\D", "", text)) <= 15:
-            return send_message(chat, "Не похоже на номер. Напишите его с кодом, например +995 555 12 34 56.")
+            return goto(chat, st, step, "Не похоже на номер. Нужен код страны, например +995.")
         st["p"] = text[:30]
-        return ask_payment(chat, st)
+        return goto(chat, st, "pay")
     if step == "comment":
         st["m"] = "" if text in ("-", "—", "нет", "Нет") else text[:300]
-        return ask_confirm(chat, st)
+        return goto(chat, st, "confirm")
+
 
 
 # -------------------------------------------------------------------- заказы
@@ -601,8 +626,14 @@ def on_callback(cq):
         arg = data[4:]
         if st and st.get("s") == "pay" and arg.isdigit() and int(arg) < len(PAYMENTS):
             st["y"] = PAYMENTS[int(arg)]
-            delete_message(chat, msg["message_id"])
-            prompt_comment(chat, st)
+            st["w"] = msg["message_id"]
+            goto(chat, st, "comment")
+    elif data == "nc":
+        st = read_state(msg)
+        if st and st.get("s") == "comment":
+            st["m"] = ""
+            st["w"] = msg["message_id"]
+            goto(chat, st, "confirm")
     elif data == "ok":
         st = read_state(msg)
         if st and st.get("s") == "confirm":
@@ -613,11 +644,11 @@ def on_callback(cq):
             place_order(chat, cq["from"], st)
         else:
             answer["text"] = "Этот заказ уже отправлен"
-    elif data == "no":
+    elif data in ("x", "no"):
         st = read_state(msg)
-        delete_message(chat, msg["message_id"])
-        send_message(chat, "Оформление отменено. Корзина сохранена в меню.",
-                     ik([[btn("🍕 Меню", cb("menu", "", cart_decode(st["c"]) if st else zero))]]))
+        if st and st.get("k"):
+            delete_message(chat, st["k"])       # убираем висящий вопрос
+        screen_cart(chat, msg, cart_decode(st["c"]) if st else zero)
     else:
         parts = data.split(":")
         if len(parts) != 3:
@@ -646,9 +677,8 @@ def on_callback(cq):
         elif kind == "info":
             screen_info(chat, msg, arg, cart)
         elif kind == "ot" and arg in ("delivery", "pickup"):
-            delete_message(chat, msg["message_id"])
-            st = {"c": code, "t": arg}
-            (prompt_address if arg == "delivery" else prompt_phone)(chat, st)
+            st = {"c": code, "t": arg, "w": msg["message_id"]}
+            goto(chat, st, "address" if arg == "delivery" else "phone")
     api("answerCallbackQuery", answer)
 
 
