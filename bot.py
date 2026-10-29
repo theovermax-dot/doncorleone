@@ -75,9 +75,9 @@ def orders_chat():
 
 # ------------------------------------------------------------ Telegram API
 class TgError(Exception):
-    def __init__(self, desc, code=None):
+    def __init__(self, desc, code=None, params=None):
         super().__init__(desc)
-        self.desc, self.code = desc, code
+        self.desc, self.code, self.params = desc, code, params or {}
 
 
 HTTP = requests.Session()
@@ -104,7 +104,7 @@ def api(method, data=None, files=None, timeout=40):
         if j.get("error_code") == 429 and attempt < 2:
             time.sleep(min(int(j.get("parameters", {}).get("retry_after", 2)), 5))
             continue
-        raise TgError(j.get("description", "error"), j.get("error_code"))
+        raise TgError(j.get("description", "error"), j.get("error_code"), j.get("parameters"))
 
 
 def send_message(chat, text, kb=None, plain=False):
@@ -413,9 +413,12 @@ def card_text(st):
     steps = steps_for(st)
     cart = cart_decode(st["c"])
     s = st["s"]
-    out = ["<b>Оформление заказа</b>"]
-    out.append(f"Шаг {steps.index(s) + 1} из {len(steps)} · {STEP_TITLE[s]}" if s in steps
-               else "Остался один клик · проверьте заказ")
+    if s == "sent":
+        out = [f"✅ <b>Заказ №{st['n']} отправлен в ресторан</b>", "Как только его подтвердят, я напишу сюда."]
+    else:
+        out = ["<b>Оформление заказа</b>"]
+        out.append(f"Шаг {steps.index(s) + 1} из {len(steps)} · {STEP_TITLE[s]}" if s in steps
+                   else "Остался один клик · проверьте заказ")
     out.append("")
     for it, q in cart_lines(cart):
         out.append(f"• {esc(it['name'])} × {q}")
@@ -445,6 +448,8 @@ def card_kb(st):
         return ik([[btn("Без комментария", "nc")], cancel])
     if s == "confirm":
         return ik([[btn("✅ Отправить заказ", "ok")], cancel])
+    if s == "sent":
+        return ik([[btn("🍕 Меню", cb("menu", "", cart_decode(EMPTY)))]])
     return ik([cancel])
 
 
@@ -485,6 +490,19 @@ def set_orders_chat(chat):
     send_message(chat, "✅ Готово, заказы будут приходить в этот чат.")
 
 
+def move_orders_chat(new):
+    """Группа стала супергруппой и у неё сменился id: переписываем адрес вебхука на новый."""
+    if ENV.get("ORDERS_CHAT_ID", "").strip():
+        log.error("чат заказов сменил id на %s, обновите ORDERS_CHAT_ID", new)
+        return
+    RUNTIME["orders"] = new
+    base = RUNTIME.get("base_url")
+    if base:
+        api("setWebhook", {"url": f"{base}?orders={new}", "secret_token": RUNTIME.get("secret"),
+                           "max_connections": 1, "allowed_updates": ["message", "callback_query"]})
+    log.warning("чат заказов переехал: %s", new)
+
+
 def handle_reply(msg, st):
     chat = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
@@ -496,7 +514,7 @@ def handle_reply(msg, st):
     if step == "address":
         if len(text) < 5:
             return goto(chat, st, step, "Напишите адрес подробнее.")
-        st["a"] = text[:300]
+        st["a"] = text[:200]
         return goto(chat, st, "phone")
     if step == "phone":
         if not 9 <= len(re.sub(r"\D", "", text)) <= 15:
@@ -504,7 +522,7 @@ def handle_reply(msg, st):
         st["p"] = text[:30]
         return goto(chat, st, "pay")
     if step == "comment":
-        st["m"] = "" if text in ("-", "—", "нет", "Нет") else text[:300]
+        st["m"] = "" if text in ("-", "—", "нет", "Нет") else text[:200]
         return goto(chat, st, "confirm")
 
 
@@ -561,24 +579,34 @@ def place_order(chat, user, st):
     lines = cart_lines(cart)
     zero = cart_decode(EMPTY)
     if not lines:
-        return send_message(chat, "Корзина пуста, заказ не отправлен.", ik([[btn("🍕 Меню", cb("menu", "", zero))]]))
+        send_message(chat, "Корзина пуста, заказ не отправлен.", ik([[btn("🍕 Меню", cb("menu", "", zero))]]))
+        return None
     target = orders_chat()
     if not target:
-        return send_message(chat, "Ресторан пока не подключён к боту, заказ не отправлен. Попробуйте позже.")
+        send_message(chat, "Ресторан пока не подключён к боту. Нажмите «Отправить заказ» ещё раз чуть позже.")
+        return None
     o = {"created": datetime.now(TZ).strftime("%d.%m %H:%M"),
          "name": " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or "Клиент",
          "username": user.get("username"), "type": st["t"], "address": st.get("a"), "phone": st["p"],
          "pay": st["y"], "comment": st.get("m"), "total": cart_total(cart),
          "items": [{"name": it["name"], "qty": q, "price": it["price"]} for it, q in lines]}
     try:
-        m = send_message(target, render_order(o, "…"), plain=True)
+        try:
+            m = send_message(target, render_order(o, "…"), plain=True)
+        except TgError as e:
+            new = e.params.get("migrate_to_chat_id")
+            if not new:
+                raise
+            move_orders_chat(new)          # группа стала супергруппой
+            target = new
+            m = send_message(target, render_order(o, "…"), plain=True)
         n = m["message_id"]          # номер заказа = id сообщения в чате ресторана
         edit_text(target, n, render_order(o, n), status_kb("new", chat, o["type"]), plain=True)
     except TgError as e:
         log.error("не смог отправить заказ в чат %s: %s", target, e)
-        return send_message(chat, "Не получилось отправить заказ в ресторан. Попробуйте ещё раз через минуту.")
-    send_message(chat, f"<b>Заказ №{n} отправлен в ресторан</b>\nКак только его подтвердят, я напишу сюда.",
-                 ik([[btn("🍕 Меню", cb("menu", "", zero))]]))
+        send_message(chat, "Не получилось отправить заказ в ресторан. Нажмите «Отправить заказ» ещё раз через минуту.")
+        return None
+    return n
 
 
 def change_status(cq):
@@ -597,6 +625,7 @@ def change_status(cq):
     except TgError as e:
         if "not modified" not in e.desc:
             raise
+        return api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "Статус уже стоит"})
     note = CUSTOMER_NOTE.get(act)
     if note:
         try:
@@ -641,7 +670,12 @@ def on_callback(cq):
                 edit_markup(chat, msg["message_id"], {"inline_keyboard": []})   # защита от двойного нажатия
             except TgError:
                 return api("answerCallbackQuery", {**answer, "text": "Этот заказ уже отправлен"})
-            place_order(chat, cq["from"], st)
+            n = place_order(chat, cq["from"], st)
+            if n:
+                st.update(s="sent", n=n)
+                edit_text(chat, msg["message_id"], card_text(st) + hidden(st), card_kb(st))
+            else:
+                edit_markup(chat, msg["message_id"], card_kb(st))   # вернуть кнопку для повтора
         else:
             answer["text"] = "Этот заказ уже отправлен"
     elif data in ("x", "no"):
@@ -687,6 +721,16 @@ def on_message(msg):
     text = (msg.get("text") or "").strip()
     zero = cart_decode(EMPTY)
 
+    if msg["chat"].get("type", "private") != "private":
+        # в группах бот только принимает заказы: реагирует на /here и на переезд группы в супергруппу
+        if msg.get("migrate_to_chat_id") and chat == orders_chat():
+            return move_orders_chat(msg["migrate_to_chat_id"])
+        if msg.get("migrate_from_chat_id") and msg["migrate_from_chat_id"] == orders_chat():
+            return move_orders_chat(chat)
+        if text.split("@")[0].split()[0:1] == ["/here"]:
+            return set_orders_chat(chat)
+        return
+
     if text.startswith("/"):
         cmd = text.split()[0].split("@")[0].lower()
         if cmd == "/start":
@@ -700,7 +744,8 @@ def on_message(msg):
         if cmd == "/cancel":
             return send_message(chat, "Оформление отменено.", ik([[btn("🍕 Меню", cb("menu", "", zero))]]))
 
-    st = read_state(msg.get("reply_to_message"))
+    reply = msg.get("reply_to_message") or {}
+    st = read_state(reply) if (reply.get("from") or {}).get("is_bot") else None
     if st and st.get("s") in ("address", "phone", "comment"):
         return handle_reply(msg, st)
     send_message(chat, "Нажмите /start, чтобы открыть меню.")
