@@ -449,7 +449,7 @@ def card_kb(st):
     if s == "confirm":
         return ik([[btn("✅ Отправить заказ", "ok")], cancel])
     if s == "sent":
-        return ik([[btn("🍕 Меню", cb("menu", "", cart_decode(EMPTY)))]])
+        return ik([[btn("🍕 Меню", "nm")]])          # меню новым сообщением, сводка заказа остаётся
     return ik([cancel])
 
 
@@ -659,6 +659,8 @@ def on_callback(cq):
 
     if data == "noop":
         pass
+    elif data == "nm":
+        screen_categories(chat, None, zero)
     elif data.startswith("pay:"):
         st = read_state(msg)
         arg = data[4:]
