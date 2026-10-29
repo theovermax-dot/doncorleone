@@ -126,6 +126,11 @@ def delete_message(chat, mid):
 
 
 def photo_file(name):
+    """Фото лежат в photos/, но если их загрузили прямо в корень репозитория, берём оттуда."""
+    for folder in ("photos", ""):
+        p = os.path.join(BASE, folder, name + ".jpg")
+        if os.path.exists(p):
+            return p
     return os.path.join(BASE, "photos", name + ".jpg")
 
 
