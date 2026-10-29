@@ -62,11 +62,15 @@ log = logging.getLogger("doncorleone")
 file_ids = {}   # кэш file_id фото, только на время жизни процесса
 
 
+RUNTIME = {}   # заполняет api/webhook.py на каждый запрос: base_url, secret и orders (чат заказов)
+
+
 def orders_chat():
+    """Чат ресторана: сначала переменная ORDERS_CHAT_ID, затем значение из адреса вебхука."""
     try:
         return int(ENV.get("ORDERS_CHAT_ID", "").strip())
     except ValueError:
-        return None
+        return RUNTIME.get("orders")
 
 
 # ------------------------------------------------------------ Telegram API
@@ -442,6 +446,23 @@ def ask_confirm(chat, st):
                  ik([[btn("✅ Отправить заказ", "ok")], [btn("✖️ Отмена", "no")]]))
 
 
+def set_orders_chat(chat):
+    """Сделать этот чат получателем заказов. Работает один раз: чат запоминается в адресе вебхука."""
+    if orders_chat() is not None:
+        return send_message(chat, "Чат для заказов уже настроен.")
+    base = RUNTIME.get("base_url")
+    if not base:   # локальный запуск без вебхука
+        return send_message(chat, f"ID этого чата: <code>{chat}</code>\nВпишите его в ORDERS_CHAT_ID в файле .env.")
+    try:
+        api("setWebhook", {"url": f"{base}?orders={chat}", "secret_token": RUNTIME.get("secret"),
+                           "max_connections": 1, "allowed_updates": ["message", "callback_query"]})
+    except TgError as e:
+        log.error("setWebhook: %s", e)
+        return send_message(chat, "Не получилось сохранить чат. Попробуйте ещё раз.")
+    RUNTIME["orders"] = chat
+    send_message(chat, "✅ Готово, заказы будут приходить в этот чат.")
+
+
 def handle_reply(msg, st):
     chat = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
@@ -645,9 +666,7 @@ def on_message(msg):
         if cmd == "/help":
             return screen_info(chat, None, "delivery", zero)
         if cmd == "/here":
-            return send_message(chat, f"ID этого чата: <code>{chat}</code>\nВпишите его в переменную "
-                                      "ORDERS_CHAT_ID (Vercel → Settings → Environment Variables) и сделайте Redeploy. "
-                                      "После этого заказы будут приходить сюда.")
+            return set_orders_chat(chat)
         if cmd == "/cancel":
             return send_message(chat, "Оформление отменено.", ik([[btn("🍕 Меню", cb("menu", "", zero))]]))
 
