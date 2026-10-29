@@ -636,6 +636,12 @@ def change_status(cq):
 
 
 # ------------------------------------------------------------------- роутинг
+def too_fast(msg):
+    """Кнопки только что поменялись: второй тап пришёлся бы в другую кнопку (например, «Принять» → «Отменить»)."""
+    edited = msg.get("edit_date")
+    return bool(edited) and time.time() - edited < 2
+
+
 def on_callback(cq):
     data = cq.get("data", "")
     msg = cq.get("message")
@@ -644,6 +650,9 @@ def on_callback(cq):
         return api("answerCallbackQuery", answer)
     chat = msg["chat"]["id"]
     zero = cart_decode(EMPTY)
+
+    if (data.startswith(("st:", "pay:")) or data == "nc") and too_fast(msg):
+        return api("answerCallbackQuery", {**answer, "text": "Секунду, кнопки обновились"})
 
     if data.startswith("st:"):
         return change_status(cq)
